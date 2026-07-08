@@ -1,0 +1,364 @@
+"""
+Rising-Phase Segmentation Pipeline
+===================================
+AI Athletes Arena — TinyML Wearable Fitness System
+Author : Fares Elamin
+
+Converts raw 15-second IMU recordings into labelled rising-phase
+CSV segments suitable for Edge Impulse ingestion.
+
+For each detected gyroscope peak, the pipeline:
+  1. Locates the preceding valley using find_valley_before_peak()
+  2. Extracts the window from (valley - 200ms) to (peak + 100ms)
+  3. Discards segments shorter than 200ms
+  4. Saves the segment as a labelled CSV file (<exercise>_start_XXXX.csv)
+"""
+
+import os
+import csv
+import json
+import numpy as np
+from scipy.signal import find_peaks, savgol_filter
+
+# ===================================================================
+# SETTINGS
+# ===================================================================
+
+BASE_INPUT_DIR = r"C:\Users\HP\Desktop\segmenting"
+OUTPUT_DIR     = r"C:\Users\HP\Desktop\done_rising"
+
+EXERCISES = [
+    "Bench press",
+    "Bicep curls",
+    "Front raises",
+    "Lateral raises",
+    "Overhead triceps",
+]
+
+SAMPLE_RATE          = 50    # IMU sampling rate (Hz)
+MIN_PEAK_DIST_MS     = 600   # Minimum time between two consecutive rep peaks (ms)
+MIN_PEAK_HEIGHT      = 30    # Hard floor: gyro must exceed this to qualify as a peak (deg/s)
+SMOOTHING_WINDOW     = 7     # Savitzky-Golay filter window length (samples)
+PROMINENCE           = 5     # Minimum peak prominence required by find_peaks (deg/s)
+PRE_VALLEY_BUFFER_MS = 200   # Time before valley to include in output window (ms)
+POST_PEAK_BUFFER_MS  = 100   # Time after peak to include in output window (ms)
+
+# ===================================================================
+# PER-EXERCISE AXIS SELECTION
+#
+# Each exercise has a dominant gyroscope axis that best captures
+# the primary joint rotation during the concentric (rising) phase.
+# This axis is used only for peak detection and segmentation;
+# the Edge Impulse model is trained on all six IMU axes.
+# ===================================================================
+
+AXIS_MODE_PER_EXERCISE = {
+    "Bench press":      "gx",   # Horizontal push — wrist rotates around X
+    "Bicep curls":      "gy",   # Elbow flexion — wrist rotates around Y
+    "Front raises":     "gz",   # Sagittal raise — wrist rotates around Z
+    "Lateral raises":   "gy",   # Frontal raise  — wrist rotates around Y
+    "Overhead triceps": "gz",   # Vertical extension — wrist rotates around Z
+}
+
+# ===================================================================
+# DERIVED CONSTANTS — do not edit
+# ===================================================================
+
+MIN_PEAK_DIST_SAMPLES = int((MIN_PEAK_DIST_MS     / 1000) * SAMPLE_RATE)
+PRE_VALLEY_BUFFER     = int((PRE_VALLEY_BUFFER_MS  / 1000) * SAMPLE_RATE)
+POST_PEAK_BUFFER      = int((POST_PEAK_BUFFER_MS   / 1000) * SAMPLE_RATE)
+MIN_SEGMENT_SAMPLES   = max(5, int(0.2 * SAMPLE_RATE))  # 200 ms minimum segment length
+INTERVAL_MS           = int(1000 / SAMPLE_RATE)          # Timestamp step (20 ms at 50 Hz)
+CSV_HEADER            = ["timestamp", "accX", "accY", "accZ", "gyrX", "gyrY", "gyrZ"]
+
+# ===================================================================
+# FILE I/O
+# ===================================================================
+
+def read_json(filepath: str) -> list:
+    """
+    Read a six-axis IMU recording from an Edge Impulse JSON export.
+    Returns a list of [ax, ay, az, gx, gy, gz] rows.
+    """
+    values = []
+    with open(filepath, "r") as f:
+        raw = json.load(f)
+    for row in raw["payload"]["values"]:
+        if len(row) < 6:
+            continue
+        values.append([float(x) for x in row[:6]])
+    return values
+
+
+def read_csv(filepath: str) -> list:
+    """
+    Read a six-axis IMU recording from a CSV file.
+    Skips the header row and any rows with fewer than six columns.
+    Returns a list of [ax, ay, az, gx, gy, gz] rows.
+    """
+    values = []
+    with open(filepath, "r", newline="") as f:
+        reader = csv.reader(f)
+        for i, row in enumerate(reader):
+            if i == 0:
+                continue  # skip header
+            if len(row) < 6:
+                continue
+            try:
+                values.append([float(x) for x in row[:6]])
+            except ValueError:
+                continue
+    return values
+
+
+def read_file(filepath: str) -> list:
+    """
+    Dispatch to the correct file reader based on extension.
+    Supports .json (Edge Impulse format) and .csv.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".json":
+        return read_json(filepath)
+    if ext == ".csv":
+        return read_csv(filepath)
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+def save_segment(filepath: str, segment: list) -> None:
+    """
+    Write one rising-phase segment to a timestamped CSV file.
+    The output format is compatible with Edge Impulse ingestion.
+    """
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADER)
+        for i, row in enumerate(segment):
+            timestamp = i * INTERVAL_MS
+            writer.writerow([timestamp] + [f"{v:.6f}" for v in row])
+
+# ===================================================================
+# SIGNAL PROCESSING
+# ===================================================================
+
+def compute_adaptive_threshold(signal: np.ndarray,
+                                hard_floor: float) -> float:
+    """
+    Compute a per-recording adaptive peak detection threshold.
+    The threshold is mean + 1 standard deviation of the smoothed signal,
+    with a hard minimum floor to suppress noise in low-activity recordings.
+    """
+    return max(hard_floor, float(signal.mean() + signal.std()))
+
+
+def find_valley_before_peak(signal: np.ndarray,
+                             peak_idx: int) -> int:
+    """
+    Locate the valley (local minimum) immediately preceding a detected peak.
+    Searches backwards from peak_idx up to MIN_PEAK_DIST_SAMPLES samples.
+    Returns the index of the minimum value in that search window.
+    """
+    search_start = max(0, peak_idx - MIN_PEAK_DIST_SAMPLES)
+    segment      = signal[search_start:peak_idx]
+
+    if len(segment) == 0:
+        return peak_idx  # edge case: peak is at the very start of the recording
+
+    local_min = int(np.argmin(segment))
+    return search_start + local_min
+
+# ===================================================================
+# CORE PROCESSING
+# ===================================================================
+
+def process_file(input_path: str,
+                 exercise_name: str,
+                 out_dir: str,
+                 seg_counter: int,
+                 file_index: int) -> int:
+    """
+    Segment one raw 15-second IMU recording into rising-phase windows.
+
+    For each detected peak:
+      - Finds the preceding valley using find_valley_before_peak()
+      - Extracts the window [valley - PRE_VALLEY_BUFFER : peak + POST_PEAK_BUFFER]
+      - Discards windows shorter than MIN_SEGMENT_SAMPLES
+      - Saves the segment as <exercise>_start_XXXX.csv
+
+    Returns the updated global segment counter.
+    """
+    print(f"\n  [{file_index}] {os.path.basename(input_path)}")
+
+    values = read_file(input_path)
+    n      = len(values)
+
+    if n == 0:
+        print("  WARNING: empty file — skipping")
+        return seg_counter
+
+    print(f"  Samples : {n}  ({n / SAMPLE_RATE:.1f} s)")
+
+    data   = np.array(values)
+    gx_arr = data[:, 3]
+    gy_arr = data[:, 4]
+    gz_arr = data[:, 5]
+
+    # Select the dominant gyroscope axis for this exercise
+    signals = {
+        "gx": gx_arr,
+        "gy": gy_arr,
+        "gz": gz_arr,
+    }
+
+    axis_mode   = AXIS_MODE_PER_EXERCISE[exercise_name]
+    gyro_signal = signals[axis_mode]
+
+    print(f"  Axis    : {axis_mode}  "
+          f"max={gyro_signal.max():.1f}  "
+          f"mean={gyro_signal.mean():.1f}  "
+          f"std={gyro_signal.std():.1f}")
+
+    # Apply Savitzky-Golay smoothing to reduce noise before peak detection
+    if n > SMOOTHING_WINDOW:
+        gyro_smooth = savgol_filter(gyro_signal, SMOOTHING_WINDOW, 2)
+    else:
+        gyro_smooth = gyro_signal.copy()
+        print("  WARNING: recording too short for smoothing")
+
+    # Compute adaptive threshold for this specific recording
+    threshold = compute_adaptive_threshold(gyro_smooth, MIN_PEAK_HEIGHT)
+    print(f"  Threshold (adaptive): {threshold:.1f}")
+
+    # Detect peaks: must exceed threshold, be separated by MIN_PEAK_DIST_SAMPLES,
+    # and have a prominence of at least PROMINENCE deg/s
+    peaks, properties = find_peaks(
+        gyro_smooth,
+        height     = threshold,
+        distance   = MIN_PEAK_DIST_SAMPLES,
+        prominence = PROMINENCE,
+    )
+
+    print(f"  Peaks detected: {len(peaks)}")
+
+    if len(peaks) == 0:
+        print("  WARNING: no peaks found — "
+              "consider lowering MIN_PEAK_HEIGHT or PROMINENCE")
+        return seg_counter
+
+    saved = 0
+
+    for rep_idx, peak_idx in enumerate(peaks):
+
+        # Locate the valley immediately before this peak
+        valley_idx = find_valley_before_peak(gyro_smooth, peak_idx)
+
+        # Define the extraction window
+        win_start = max(0, valley_idx - PRE_VALLEY_BUFFER)
+        win_end   = min(n,  peak_idx  + POST_PEAK_BUFFER)
+        segment   = data[win_start:win_end].tolist()
+
+        # Discard segments that are too short to be meaningful
+        if len(segment) < MIN_SEGMENT_SAMPLES:
+            print(f"  Rep {rep_idx + 1:2d} — skipped "
+                  f"(too short: {len(segment)} samples)")
+            continue
+
+        # Save the segment with an Edge Impulse compatible label
+        label    = exercise_name + "_start"
+        filename = f"{label}_{seg_counter:04d}.csv"
+        save_segment(os.path.join(out_dir, filename), segment)
+
+        duration_ms = len(segment) * INTERVAL_MS
+        print(f"  Rep {rep_idx + 1:2d} | "
+              f"valley={valley_idx}  peak={peak_idx}  "
+              f"window=[{win_start}:{win_end}]  "
+              f"samples={len(segment)}  ({duration_ms} ms)  "
+              f"peak_val={gyro_smooth[peak_idx]:.1f}  "
+              f"prom={properties['prominences'][rep_idx]:.1f}")
+
+        seg_counter += 1
+        saved       += 1
+
+    print(f"  Saved: {saved} segment(s)")
+    return seg_counter
+
+
+def process_exercise(exercise_name: str) -> tuple:
+    """
+    Process all recordings for one exercise class.
+    Creates a dedicated output subfolder named <exercise>_start.
+    Returns (total_segments_saved, list_of_failed_filenames).
+    """
+    input_dir = os.path.join(BASE_INPUT_DIR, exercise_name)
+    out_dir   = os.path.join(OUTPUT_DIR, exercise_name + "_start")
+
+    if not os.path.isdir(input_dir):
+        print(f"\n[SKIP] No folder found for: {exercise_name}")
+        return 0, []
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    files = sorted([
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith((".csv", ".json"))
+    ])
+
+    if not files:
+        print(f"\n[SKIP] No CSV/JSON files in: {input_dir}")
+        return 0, []
+
+    print(f"\n{'='*60}")
+    print(f"Exercise : {exercise_name}  ({len(files)} files)")
+    print(f"Axis     : {AXIS_MODE_PER_EXERCISE[exercise_name]}")
+    print(f"Output   : {out_dir}")
+    print(f"{'='*60}")
+
+    seg_counter = 0
+    failed      = []
+
+    for i, fname in enumerate(files):
+        fpath = os.path.join(input_dir, fname)
+        try:
+            seg_counter = process_file(
+                fpath, exercise_name, out_dir, seg_counter, i + 1)
+        except Exception as e:
+            print(f"  ERROR processing {fname}: {e}")
+            failed.append(fname)
+
+    return seg_counter, failed
+
+# ===================================================================
+# ENTRY POINT
+# ===================================================================
+
+def main():
+    """
+    Run the rising-phase segmentation pipeline across all exercises.
+    Prints a grand summary and lists any files that failed to process.
+    """
+    print("Rising-Phase Segmentation Pipeline")
+    print(f"Input  : {BASE_INPUT_DIR}")
+    print(f"Output : {OUTPUT_DIR}")
+
+    grand_total = 0
+    all_failed  = {}
+
+    for exercise in EXERCISES:
+        total, failed = process_exercise(exercise)
+        grand_total  += total
+        if failed:
+            all_failed[exercise] = failed
+
+    print(f"\n{'='*60}")
+    print(f"DONE — Total segments saved: {grand_total}")
+
+    if all_failed:
+        print("\nFailed files:")
+        for ex, files in all_failed.items():
+            for f in files:
+                print(f"  [{ex}] {f}")
+    else:
+        print("All files processed successfully.")
+
+
+if __name__ == "__main__":
+    main()
